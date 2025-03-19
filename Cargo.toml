@@ -1,0 +1,17 @@
+[package]
+name = "migration-check"
+version = "0.1.0"
+edition = "2024"
+description = "A tool to check for migration in Rust code"
+license = "MIT"
+authors = ["Yukang, moorekang@gmail.com"]
+
+[dependencies]
+syn = { version = "1.0", features = ["full", "visit"] }
+quote = "1.0"
+sha2 = "0.10"
+walkdir = "2.1.4"
+proc-macro2 = "1.0"
+serde_json = { version = "1.0" }
+serde = { version = "1.0.197", features = ["derive"] }
+clap = { version = "4.5.0", features = ["derive"] }
