@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::process::exit;
-use syn::Type;
 use syn::visit::Visit;
+use syn::Type;
 use syn::{Fields, ItemStruct};
 use walkdir::WalkDir;
 
@@ -205,7 +205,7 @@ impl SynVisitor {
         if failed {
             eprintln!("migration check failed ...");
             eprintln!(
-                "Please use `migration-check -d {} -o {} -u` to update the fingerprint, and remember to write a migration",
+                "Please use `migration-check -s {} -o {} -u` to update the fingerprint, and remember to write a migration",
                 self.dir, output
             );
             exit(1);
