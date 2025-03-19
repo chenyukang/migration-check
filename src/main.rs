@@ -104,6 +104,7 @@ impl SynVisitor {
         if let Ok(file) = syn::parse_file(&code) {
             if file_path.to_string_lossy().contains("/gen/")
                 || file_path.to_string_lossy().contains("/migrations/")
+                || file_path.to_string_lossy().contains("/rpc/")
             {
                 return;
             }
