@@ -173,24 +173,24 @@ impl SynVisitor {
         }
     }
 
-    fn recurisve_dupm_finger(
+    fn collect_fingerprints(
         &self,
         type_name: &str,
         visited: &mut HashMap<String, bool>,
-        dump_fingers: &mut BTreeMap<String, String>,
+        fingerprints: &mut BTreeMap<String, String>,
     ) {
         if visited.contains_key(type_name) {
             return;
         }
         let finger = self.type_fingerprint.get(type_name);
         if let Some(finger) = finger {
-            dump_fingers.insert(type_name.to_string(), finger.clone());
+            fingerprints.insert(type_name.to_string(), finger.clone());
         }
 
         visited.insert(type_name.to_string(), true);
         if let Some(deps_vec) = self.type_deps.get(type_name) {
             for dep in deps_vec {
-                self.recurisve_dupm_finger(dep, visited, dump_fingers);
+                self.collect_fingerprints(dep, visited, fingerprints);
             }
         }
     }
@@ -199,7 +199,7 @@ impl SynVisitor {
         let mut dump_fingers = BTreeMap::new();
         let mut visited = HashMap::new();
         for type_name in &self.store_types {
-            self.recurisve_dupm_finger(type_name, &mut visited, &mut dump_fingers);
+            self.collect_fingerprints(type_name, &mut visited, &mut dump_fingers);
         }
         dump_fingers
     }
