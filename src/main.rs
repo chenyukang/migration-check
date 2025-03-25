@@ -15,6 +15,9 @@ pub struct SynVisitor {
     type_deps: HashMap<String, Vec<String>>,
     store_types: Vec<String>,
     dir: String,
+    in_rpc: bool,
+    has_error: bool,
+    current_file: String,
 }
 
 impl SynVisitor {
@@ -25,6 +28,9 @@ impl SynVisitor {
             type_deps: HashMap::new(),
             store_types: Vec::new(),
             dir: dir.to_string(),
+            in_rpc: false,
+            has_error: false,
+            current_file: String::new(),
         }
     }
 
@@ -54,6 +60,54 @@ impl SynVisitor {
         })
     }
 
+    // check if the field is a number and has the serde_as attribute
+    // with the expected value
+    // e.g. #[serde_as(as = "Option<u8>")]
+    // or #[serde_as(as = "u8")]
+    fn check_rpc_field(&mut self, struct_name: &str, field: &syn::Field) {
+        let ty = field.ty.clone();
+        let dep_types = self.calc_dep_types(ty);
+        if dep_types.len() > 2 {
+            return;
+        }
+        let last = dep_types.last().unwrap();
+        if !(last == "u8" || last == "u16" || last == "u32" || last == "u64" || last == "u128") {
+            //eprintln!("Field type is not a number: {}", last);
+            return;
+        }
+        let is_option = dep_types.len() == 2 && dep_types[0] == "Option";
+
+        let serde_attrs = field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path.is_ident("serde_as"))
+            .collect::<Vec<_>>();
+        let expected_hex = format!("{}Hex", last.to_uppercase());
+        let expected_serde_as_value = if is_option {
+            format!("Option<{}>", expected_hex)
+        } else {
+            expected_hex
+        };
+
+        if !serde_attrs.iter().any(|attr| {
+            let attr_str = attr.tokens.to_string();
+            if let Some(attr_value) = attr_str.split('=').nth(1) {
+                attr_value.contains(&expected_serde_as_value)
+            } else {
+                false
+            }
+        }) {
+            eprintln!(
+                "File: {} struct/enum: {} field_name: {} expected serde_as: {}, but you missed it",
+                self.current_file,
+                struct_name,
+                field.ident.as_ref().unwrap(),
+                expected_serde_as_value
+            );
+            self.has_error = true;
+        }
+    }
+
     fn visit_item_struct(&mut self, item_struct: &ItemStruct) {
         let struct_name = item_struct.ident.to_string();
         self.types.push(struct_name.clone());
@@ -69,6 +123,10 @@ impl SynVisitor {
                     if self.should_skip_field(field) {
                         continue;
                     }
+                    if self.in_rpc {
+                        self.check_rpc_field(&struct_name, field);
+                        continue;
+                    }
 
                     let field_name = field.ident.as_ref().unwrap().to_string();
                     let field_type = quote::quote! { #field.ty }.to_string();
@@ -79,12 +137,14 @@ impl SynVisitor {
             _ => {}
         }
 
-        let mut hasher = Sha256::new();
-        hasher.update(fingerprint.as_bytes());
-        let finger_hash = format!("{:x}", hasher.finalize());
-        self.type_fingerprint
-            .insert(struct_name.clone(), finger_hash.clone());
-        self.add_type_deps(&struct_name, dep_types.clone());
+        if !self.in_rpc {
+            let mut hasher = Sha256::new();
+            hasher.update(fingerprint.as_bytes());
+            let finger_hash = format!("{:x}", hasher.finalize());
+            self.type_fingerprint
+                .insert(struct_name.clone(), finger_hash.clone());
+            self.add_type_deps(&struct_name, dep_types.clone());
+        }
     }
 
     fn add_type_deps(&mut self, type_name: &str, dep_types: Vec<String>) {
@@ -102,13 +162,14 @@ impl SynVisitor {
     fn visit_source_file(&mut self, file_path: &std::path::Path) {
         let code = std::fs::read_to_string(file_path).unwrap();
         if let Ok(file) = syn::parse_file(&code) {
-            if file_path.to_string_lossy().contains("/gen/")
-                || file_path.to_string_lossy().contains("/migrations/")
-                || file_path.to_string_lossy().contains("/rpc/")
-            {
+            let file_path = file_path.to_string_lossy();
+            if file_path.contains("/gen/") || file_path.contains("/migrations/") {
                 return;
             }
+            self.in_rpc = file_path.contains("/rpc/");
+            self.current_file = file_path.to_string();
             self.visit_file(&file);
+            self.in_rpc = false;
         }
     }
 
@@ -176,7 +237,12 @@ impl SynVisitor {
             .collect::<Vec<String>>()
     }
 
-    pub fn check_finger_and_dump(&self, output: String, update: bool) {
+    pub fn report_and_dump(&self, output: String, update: bool) {
+        if self.has_error {
+            eprintln!("Please fix the errors in src/rpc");
+            exit(1);
+        }
+
         let old_finger: HashMap<String, String> = if !std::path::Path::new(&output).exists() {
             Default::default()
         } else {
@@ -270,6 +336,10 @@ impl Visit<'_> for SynVisitor {
                 if self.should_skip_field(field) {
                     continue;
                 }
+                if self.in_rpc {
+                    self.check_rpc_field(&enum_name, field);
+                    continue;
+                }
 
                 let field_type = quote::quote! { #field.ty }.to_string();
                 fingerprint.push_str(&format!("field:{}\n", field_type));
@@ -278,13 +348,15 @@ impl Visit<'_> for SynVisitor {
             }
         }
 
-        let mut hasher = Sha256::new();
-        hasher.update(fingerprint.as_bytes());
-        let finger_hash = format!("{:x}", hasher.finalize());
-        self.type_fingerprint.insert(enum_name.clone(), finger_hash);
-        self.add_type_deps(&enum_name, dep_types.clone());
-        if enum_name == "KeyValue" {
-            self.store_types = dep_types.clone();
+        if !self.in_rpc {
+            let mut hasher = Sha256::new();
+            hasher.update(fingerprint.as_bytes());
+            let finger_hash = format!("{:x}", hasher.finalize());
+            self.type_fingerprint.insert(enum_name.clone(), finger_hash);
+            self.add_type_deps(&enum_name, dep_types.clone());
+            if enum_name == "KeyValue" {
+                self.store_types = dep_types.clone();
+            }
         }
     }
 }
@@ -313,8 +385,8 @@ fn main() {
 
     let output = cli.output.clone().unwrap_or_else(|| {
         let mut path = cli.source_code_dir.clone();
-        path.push_str(".store_digest.json");
+        path.push_str(".schema.json");
         path
     });
-    visitor.check_finger_and_dump(output, cli.update);
+    visitor.report_and_dump(output, cli.update);
 }
