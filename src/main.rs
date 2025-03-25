@@ -108,7 +108,7 @@ impl SynVisitor {
         }
     }
 
-    fn visit_item_struct(&mut self, item_struct: &ItemStruct) {
+    fn inner_visit_item_struct(&mut self, item_struct: &ItemStruct) {
         let struct_name = item_struct.ident.to_string();
         self.types.push(struct_name.clone());
 
@@ -128,9 +128,10 @@ impl SynVisitor {
                         continue;
                     }
 
-                    let field_name = field.ident.as_ref().unwrap().to_string();
+                    //let field_name = field.ident.as_ref().unwrap().to_string();
                     let field_type = quote::quote! { #field.ty }.to_string();
-                    fingerprint.push_str(&format!("field:{}:{}\n", field_name, field_type));
+                    let field_type = field_type.split(":").last().unwrap_or_default();
+                    fingerprint.push_str(&format!("field: {}\n", field_type));
                     dep_types.extend(self.calc_dep_types(field.ty.clone()));
                 }
             }
@@ -144,6 +145,45 @@ impl SynVisitor {
             self.type_fingerprint
                 .insert(struct_name.clone(), finger_hash.clone());
             self.add_type_deps(&struct_name, dep_types.clone());
+        }
+    }
+
+    fn inner_visit_item_enum(&mut self, item_enum: &'_ syn::ItemEnum) {
+        let enum_name = item_enum.ident.to_string();
+        let mut dep_types = vec![];
+        self.types.push(enum_name.clone());
+
+        let mut fingerprint = String::new();
+        fingerprint.push_str(&format!("enum_name:{}\n", enum_name));
+
+        for variant in &item_enum.variants {
+            let variant_name = variant.ident.to_string();
+            fingerprint.push_str(&format!("variant:{}\n", variant_name));
+
+            for field in &variant.fields {
+                if self.should_skip_field(field) {
+                    continue;
+                }
+                if self.in_rpc {
+                    self.check_rpc_field(&enum_name, field);
+                    continue;
+                }
+
+                let field_type = quote::quote! { #field.ty }.to_string();
+                fingerprint.push_str(&format!("field:{}\n", field_type));
+                dep_types.extend(self.calc_dep_types(field.ty.clone()));
+            }
+        }
+
+        if !self.in_rpc {
+            let mut hasher = Sha256::new();
+            hasher.update(fingerprint.as_bytes());
+            let finger_hash = format!("{:x}", hasher.finalize());
+            self.type_fingerprint.insert(enum_name.clone(), finger_hash);
+            self.add_type_deps(&enum_name, dep_types.clone());
+            if enum_name == "KeyValue" {
+                self.store_types = dep_types.clone();
+            }
         }
     }
 
@@ -303,12 +343,12 @@ impl SynVisitor {
 
 impl Visit<'_> for SynVisitor {
     fn visit_item_struct(&mut self, item_struct: &ItemStruct) {
-        self.visit_item_struct(item_struct);
+        self.inner_visit_item_struct(item_struct);
     }
 
     fn visit_item(&mut self, item: &syn::Item) {
         match item {
-            syn::Item::Struct(item_struct) => self.visit_item_struct(item_struct),
+            syn::Item::Struct(item_struct) => self.inner_visit_item_struct(item_struct),
             syn::Item::Enum(item_enum) => self.visit_item_enum(item_enum),
             syn::Item::Type(item_type) => {
                 let type_name = item_type.ident.to_string();
@@ -321,43 +361,7 @@ impl Visit<'_> for SynVisitor {
     }
 
     fn visit_item_enum(&mut self, item_enum: &'_ syn::ItemEnum) {
-        let enum_name = item_enum.ident.to_string();
-        let mut dep_types = vec![];
-        self.types.push(enum_name.clone());
-
-        let mut fingerprint = String::new();
-        fingerprint.push_str(&format!("enum_name:{}\n", enum_name));
-
-        for variant in &item_enum.variants {
-            let variant_name = variant.ident.to_string();
-            fingerprint.push_str(&format!("variant:{}\n", variant_name));
-
-            for field in &variant.fields {
-                if self.should_skip_field(field) {
-                    continue;
-                }
-                if self.in_rpc {
-                    self.check_rpc_field(&enum_name, field);
-                    continue;
-                }
-
-                let field_type = quote::quote! { #field.ty }.to_string();
-                fingerprint.push_str(&format!("field:{}\n", field_type));
-
-                dep_types.extend(self.calc_dep_types(field.ty.clone()));
-            }
-        }
-
-        if !self.in_rpc {
-            let mut hasher = Sha256::new();
-            hasher.update(fingerprint.as_bytes());
-            let finger_hash = format!("{:x}", hasher.finalize());
-            self.type_fingerprint.insert(enum_name.clone(), finger_hash);
-            self.add_type_deps(&enum_name, dep_types.clone());
-            if enum_name == "KeyValue" {
-                self.store_types = dep_types.clone();
-            }
-        }
+        self.inner_visit_item_enum(item_enum);
     }
 }
 
