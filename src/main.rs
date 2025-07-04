@@ -70,7 +70,9 @@ impl SynVisitor {
         if dep_types.len() > 2 {
             return;
         }
-        let last = dep_types.last().unwrap();
+        let Some(last) = dep_types.last() else {
+            return;
+        };
         if !(last == "u8" || last == "u16" || last == "u32" || last == "u64" || last == "u128") {
             //eprintln!("Field type is not a number: {}", last);
             return;
