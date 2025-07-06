@@ -54,9 +54,9 @@ impl SynVisitor {
 
     fn should_skip_field(&self, field: &syn::Field) -> bool {
         field.attrs.iter().any(|attr| {
-            let attr_name = attr.path.segments.last().unwrap().ident.to_string();
-            let attr_value = attr.tokens.to_string();
-            attr_name == "serde" && attr_value.contains("skip")
+            let attr_name = attr.path().segments.last().unwrap().ident.to_string();
+            //let attr_value = attr.tokens.to_string();
+            attr_name == "serde"
         })
     }
 
@@ -73,8 +73,10 @@ impl SynVisitor {
         let Some(last) = dep_types.last() else {
             return;
         };
+        if field.ident.is_none() {
+            return;
+        }
         if !(last == "u8" || last == "u16" || last == "u32" || last == "u64" || last == "u128") {
-            //eprintln!("Field type is not a number: {}", last);
             return;
         }
         let is_option = dep_types.len() == 2 && dep_types[0] == "Option";
@@ -82,7 +84,7 @@ impl SynVisitor {
         let serde_attrs = field
             .attrs
             .iter()
-            .filter(|attr| attr.path.is_ident("serde_as"))
+            .filter(|attr| attr.path().is_ident("serde_as") || attr.path().is_ident("serde"))
             .collect::<Vec<_>>();
         let expected_hex = format!("{}Hex", last.to_uppercase());
         let expected_serde_as_value = if is_option {
@@ -92,7 +94,7 @@ impl SynVisitor {
         };
 
         if !serde_attrs.iter().any(|attr| {
-            let attr_str = attr.tokens.to_string();
+            let attr_str = self.get_attr_tokens(attr);
             if let Some(attr_value) = attr_str.split('=').nth(1) {
                 attr_value.contains(&expected_serde_as_value)
             } else {
@@ -100,13 +102,18 @@ impl SynVisitor {
             }
         }) {
             eprintln!(
-                "File: {} struct/enum: {} field_name: {} expected serde_as: {}, but you missed it",
-                self.current_file,
-                struct_name,
-                field.ident.as_ref().unwrap(),
-                expected_serde_as_value
+                "File: {} struct/enum: {} field_name: {:?} expected serde_as: {}, but you missed it",
+                self.current_file, struct_name, field.ident, expected_serde_as_value
             );
             self.has_error = true;
+        }
+    }
+
+    fn get_attr_tokens(&self, attr: &syn::Attribute) -> String {
+        match &attr.meta {
+            syn::Meta::List(meta_list) => meta_list.tokens.to_string(),
+            syn::Meta::NameValue(_meta_name_value) => "".to_string(),
+            _ => String::new(),
         }
     }
 
