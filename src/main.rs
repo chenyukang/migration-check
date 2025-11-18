@@ -253,7 +253,7 @@ impl SynVisitor {
         dump_fingers
     }
 
-    fn recurisve_find_type(
+    fn recursive_find_type(
         &self,
         target_type: &str,
         type_name: &str,
@@ -269,7 +269,7 @@ impl SynVisitor {
         if let Some(deps_vec) = self.type_deps.get(type_name) {
             for dep in deps_vec {
                 let mut next_chain = current_chain.clone();
-                self.recurisve_find_type(target_type, dep, &mut next_chain, result);
+                self.recursive_find_type(target_type, dep, &mut next_chain, result);
             }
         }
     }
@@ -278,7 +278,7 @@ impl SynVisitor {
         let mut result = vec![];
         for type_name in &self.store_types {
             let mut current_chain = vec![];
-            self.recurisve_find_type(target_type, type_name, &mut current_chain, &mut result);
+            self.recursive_find_type(target_type, type_name, &mut current_chain, &mut result);
         }
         result
             .iter()
@@ -336,16 +336,22 @@ impl SynVisitor {
 
     pub fn walk_dir(&mut self) {
         let dir = self.dir.clone();
+        let mut files = vec![];
         for entry in WalkDir::new(dir).follow_links(true).into_iter() {
             match entry {
                 Ok(ref e)
                     if !e.file_name().to_string_lossy().starts_with('.')
                         && e.file_name().to_string_lossy().ends_with(".rs") =>
                 {
-                    self.visit_source_file(e.path());
+                    files.push(e.path().to_owned());
                 }
                 _ => (),
             }
+        }
+        // different order may produce different hash
+        files.sort();
+        for file_path in files {
+            self.visit_source_file(&file_path);
         }
     }
 }
