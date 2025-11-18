@@ -217,6 +217,7 @@ impl SynVisitor {
             }
             self.in_rpc = file_path.contains("/rpc/");
             self.current_file = file_path.to_string();
+            eprintln!("Visiting file: {}", self.current_file);
             self.visit_file(&file);
             self.in_rpc = false;
         }
@@ -336,16 +337,21 @@ impl SynVisitor {
 
     pub fn walk_dir(&mut self) {
         let dir = self.dir.clone();
+        let mut files = vec![];
         for entry in WalkDir::new(dir).follow_links(true).into_iter() {
             match entry {
                 Ok(ref e)
                     if !e.file_name().to_string_lossy().starts_with('.')
                         && e.file_name().to_string_lossy().ends_with(".rs") =>
                 {
-                    self.visit_source_file(e.path());
+                    files.push(e.path().to_owned());
                 }
                 _ => (),
             }
+        }
+        files.sort();
+        for file_path in files {
+            self.visit_source_file(&file_path);
         }
     }
 }
