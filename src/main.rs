@@ -3,31 +3,88 @@ use proc_macro2::TokenTree;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::process::exit;
 use syn::visit::Visit;
 use syn::Type;
 use syn::{Fields, ItemStruct};
 use walkdir::WalkDir;
 
+/// Well-known primitive types and external crate types that are not expected
+/// to be defined in the scanned source directories. These are excluded from
+/// the "store types must live in types-dir" check.
+const BUILTIN_TYPES: &[&str] = &[
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "f32",
+    "f64",
+    "bool",
+    "String",
+    "str",
+    "usize",
+    "isize",
+    "Option",
+    "Vec",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "BTreeSet",
+    "Box",
+    "Arc",
+    "Rc",
+    "Cow",
+    "PhantomData",
+    "Duration",
+    // External crate types commonly seen in KeyValue
+    "PeerId",
+    "OutPoint",
+];
+
 pub struct SynVisitor {
     types: Vec<String>,
     type_fingerprint: HashMap<String, String>,
     type_deps: HashMap<String, Vec<String>>,
     store_types: Vec<String>,
-    dir: String,
+    /// All source directories to scan
+    dirs: Vec<String>,
+    /// Optional: the types-dir path prefix. Types defined in files under this
+    /// directory are considered "in the types crate".
+    types_dir: Option<String>,
+    /// Records which file each type was first defined in.
+    type_file: HashMap<String, String>,
+    /// Types that derive `Serialize` via `#[derive(Serialize)]`.
+    /// For these types, we know ALL non-skipped fields are serialized, so we
+    /// follow their field deps in the types-dir check.
+    derive_serializable_types: HashSet<String>,
+    /// Types that have a custom `impl Serialize for T`.
+    /// For these, we can't determine which fields are serialized from syntax
+    /// alone, so we include them in the check but DON'T follow their field deps.
+    custom_serializable_types: HashSet<String>,
     in_rpc: bool,
     has_error: bool,
     current_file: String,
 }
 
 impl SynVisitor {
-    pub fn new(dir: &str) -> Self {
+    pub fn new(dirs: Vec<String>, types_dir: Option<String>) -> Self {
         SynVisitor {
             types: Vec::new(),
             type_fingerprint: HashMap::new(),
             type_deps: HashMap::new(),
             store_types: Vec::new(),
-            dir: dir.to_string(),
+            dirs,
+            types_dir,
+            type_file: HashMap::new(),
+            derive_serializable_types: HashSet::new(),
+            custom_serializable_types: HashSet::new(),
             in_rpc: false,
             has_error: false,
             current_file: String::new(),
@@ -47,16 +104,52 @@ impl SynVisitor {
                     }
                 }
             }
+            Type::Tuple(type_tuple) => {
+                for elem in &type_tuple.elems {
+                    dep_types.extend(self.calc_dep_types(elem.clone()));
+                }
+            }
             _ => {}
         }
         dep_types
     }
 
+    /// Check if the item attributes include `#[derive(Serialize, ...)]`.
+    fn has_serialize_derive(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            if !attr.path().is_ident("derive") {
+                return false;
+            }
+            if let syn::Meta::List(meta_list) = &attr.meta {
+                let tokens_str = meta_list.tokens.to_string();
+                // Check for "Serialize" as a standalone token in the derive list
+                tokens_str.split(',').any(|part| part.trim() == "Serialize")
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Returns true if the field has `#[serde(skip)]`, `#[serde(skip_serializing)]`,
+    /// or `#[serde(skip_deserializing)]` — meaning it is never (fully) serialized
+    /// and should be excluded from the fingerprint and dependency graph.
+    /// Other serde attributes (rename, default, skip_serializing_if, etc.) do NOT
+    /// cause a field to be skipped.
     fn should_skip_field(&self, field: &syn::Field) -> bool {
         field.attrs.iter().any(|attr| {
             let attr_name = attr.path().segments.last().unwrap().ident.to_string();
-            //let attr_value = attr.tokens.to_string();
-            attr_name == "serde"
+            if attr_name != "serde" {
+                return false;
+            }
+            let tokens = self.get_attr_tokens(attr);
+            // Split by comma to check each individual directive.
+            // e.g. #[serde(skip, default)] → tokens = "skip , default"
+            tokens.split(',').any(|part| {
+                let trimmed = part.trim();
+                trimmed == "skip"
+                    || trimmed == "skip_serializing"
+                    || trimmed == "skip_deserializing"
+            })
         })
     }
 
@@ -117,9 +210,37 @@ impl SynVisitor {
         }
     }
 
+    /// Returns true if the current file is under a `/rpc/` directory.
+    /// Types defined there are RPC-specific wrappers and should not shadow
+    /// the canonical definitions in the types crate.
+    fn is_rpc_file(&self) -> bool {
+        self.current_file.contains("/rpc/")
+    }
+
+    /// Record the file where a type is defined, preferring non-RPC locations.
+    /// If the type was previously recorded from an RPC file and we now see it
+    /// in a non-RPC file, overwrite the record.
+    fn record_type_file(&mut self, type_name: &str) {
+        if self.is_rpc_file() {
+            // Only insert if this type has never been seen before
+            self.type_file
+                .entry(type_name.to_string())
+                .or_insert_with(|| self.current_file.clone());
+        } else {
+            // Non-RPC file always takes priority — overwrite any previous entry
+            self.type_file
+                .insert(type_name.to_string(), self.current_file.clone());
+        }
+    }
+
     fn inner_visit_item_struct(&mut self, item_struct: &ItemStruct) {
         let struct_name = item_struct.ident.to_string();
         self.types.push(struct_name.clone());
+        self.record_type_file(&struct_name);
+
+        if Self::has_serialize_derive(&item_struct.attrs) {
+            self.derive_serializable_types.insert(struct_name.clone());
+        }
 
         let mut fingerprint = String::new();
 
@@ -129,19 +250,19 @@ impl SynVisitor {
         match &item_struct.fields {
             Fields::Named(fields) => {
                 for field in &fields.named {
-                    if self.should_skip_field(field) {
-                        continue;
-                    }
                     if self.in_rpc {
+                        // RPC check runs on all fields (regardless of serde attrs)
                         self.check_rpc_field(&struct_name, field);
-                        continue;
+                    } else {
+                        // For fingerprint/deps, skip fields with #[serde(skip)]
+                        if self.should_skip_field(field) {
+                            continue;
+                        }
+                        let field_type = quote::quote! { #field.ty }.to_string();
+                        let field_type = field_type.split(":").last().unwrap_or_default();
+                        fingerprint.push_str(&format!("field: {}\n", field_type));
+                        dep_types.extend(self.calc_dep_types(field.ty.clone()));
                     }
-
-                    //let field_name = field.ident.as_ref().unwrap().to_string();
-                    let field_type = quote::quote! { #field.ty }.to_string();
-                    let field_type = field_type.split(":").last().unwrap_or_default();
-                    fingerprint.push_str(&format!("field: {}\n", field_type));
-                    dep_types.extend(self.calc_dep_types(field.ty.clone()));
                 }
             }
             _ => {}
@@ -161,6 +282,11 @@ impl SynVisitor {
         let enum_name = item_enum.ident.to_string();
         let mut dep_types = vec![];
         self.types.push(enum_name.clone());
+        self.record_type_file(&enum_name);
+
+        if Self::has_serialize_derive(&item_enum.attrs) {
+            self.derive_serializable_types.insert(enum_name.clone());
+        }
 
         let mut fingerprint = String::new();
         fingerprint.push_str(&format!("enum_name:{}\n", enum_name));
@@ -170,17 +296,18 @@ impl SynVisitor {
             fingerprint.push_str(&format!("variant:{}\n", variant_name));
 
             for field in &variant.fields {
-                if self.should_skip_field(field) {
-                    continue;
-                }
                 if self.in_rpc {
+                    // RPC check runs on all fields (regardless of serde attrs)
                     self.check_rpc_field(&enum_name, field);
-                    continue;
+                } else {
+                    // For fingerprint/deps, skip fields with #[serde(skip)]
+                    if self.should_skip_field(field) {
+                        continue;
+                    }
+                    let field_type = quote::quote! { #field.ty }.to_string();
+                    fingerprint.push_str(&format!("field:{}\n", field_type));
+                    dep_types.extend(self.calc_dep_types(field.ty.clone()));
                 }
-
-                let field_type = quote::quote! { #field.ty }.to_string();
-                fingerprint.push_str(&format!("field:{}\n", field_type));
-                dep_types.extend(self.calc_dep_types(field.ty.clone()));
             }
         }
 
@@ -253,6 +380,113 @@ impl SynVisitor {
         dump_fingers
     }
 
+    /// Collect types reachable from the store types that are actually part of
+    /// serialized data. A type is included if:
+    /// 1. It is a direct KeyValue variant type, OR
+    /// 2. It is a dependency of a type with `#[derive(Serialize)]`
+    ///
+    /// Types with custom `impl Serialize` are included but their field deps
+    /// are NOT followed (since we can't know which fields the custom impl
+    /// actually serializes).
+    ///
+    /// Types without any Serialize impl are NOT traversed — they appear in
+    /// fields that are never serialized (actor messages, error types, etc.).
+    fn collect_serializable_store_types(&self) -> HashSet<String> {
+        let builtin: HashSet<&str> = BUILTIN_TYPES.iter().copied().collect();
+        let mut result = HashSet::new();
+        let mut visited = HashSet::new();
+
+        fn collect_recursive(
+            visitor: &SynVisitor,
+            type_name: &str,
+            visited: &mut HashSet<String>,
+            result: &mut HashSet<String>,
+            builtin: &HashSet<&str>,
+        ) {
+            if visited.contains(type_name) || builtin.contains(type_name) {
+                return;
+            }
+            visited.insert(type_name.to_string());
+
+            // For types with custom `impl Serialize`: skip entirely.
+            // These are wrappers (like ChannelActorState) whose actual serialized
+            // content is an inner type that will be checked separately.
+            // We can't determine which fields are serialized from syntax alone.
+            if visitor.custom_serializable_types.contains(type_name) {
+                return;
+            }
+
+            // Only include this type if it has a fingerprint (i.e., it was defined
+            // in the scanned source)
+            if visitor.type_fingerprint.contains_key(type_name) {
+                result.insert(type_name.to_string());
+            }
+
+            // For types with #[derive(Serialize)]: follow their field deps
+            // (we know all non-skipped fields are serialized).
+            if visitor.derive_serializable_types.contains(type_name) {
+                if let Some(deps_vec) = visitor.type_deps.get(type_name) {
+                    for dep in deps_vec {
+                        collect_recursive(visitor, dep, visited, result, builtin);
+                    }
+                }
+                return;
+            }
+
+            // Types without any Serialize: don't traverse further.
+            // They appear in the dep graph but are not part of serialized data.
+        }
+
+        for type_name in &self.store_types {
+            collect_recursive(self, type_name, &mut visited, &mut result, &builtin);
+        }
+        result
+    }
+
+    /// Check that all types included in the migration schema are defined in
+    /// the types-dir. Only checks types that are serializable and reachable
+    /// from KeyValue. Returns true if all checks pass.
+    pub fn check_store_types_in_types_dir(&self) -> bool {
+        let types_dir = match &self.types_dir {
+            Some(d) => d,
+            None => return true, // no types-dir specified, skip check
+        };
+
+        let builtin: HashSet<&str> = BUILTIN_TYPES.iter().copied().collect();
+        let store_types = self.collect_serializable_store_types();
+        let mut has_error = false;
+
+        for type_name in store_types.iter() {
+            // Skip builtin/external types
+            if builtin.contains(type_name.as_str()) {
+                continue;
+            }
+            // Check where this type is defined
+            if let Some(file_path) = self.type_file.get(type_name) {
+                if !file_path.contains(types_dir) {
+                    eprintln!(
+                        "WARNING: Store type `{}` is NOT defined in types-dir ({}), found in: {}",
+                        type_name, types_dir, file_path
+                    );
+                    // Print a short dependency chain for context (only first chain)
+                    let chains = self.try_find_type_chain(type_name);
+                    if let Some(chain) = chains.first() {
+                        eprintln!("  Dependency chain: {}", chain);
+                    }
+                    has_error = true;
+                }
+            }
+        }
+
+        if has_error {
+            eprintln!();
+            eprintln!("Some store types are defined outside of the types crate.");
+            eprintln!("Please move them to the types crate to ensure migration safety.");
+        }
+
+        !has_error
+    }
+
     fn recursive_find_type(
         &self,
         target_type: &str,
@@ -263,6 +497,10 @@ impl SynVisitor {
         if target_type == type_name {
             current_chain.push(type_name.to_string());
             result.push(current_chain.clone());
+            return;
+        }
+        // Cycle detection: skip if we've already visited this type in the chain
+        if current_chain.contains(&type_name.to_string()) {
             return;
         }
         current_chain.push(type_name.to_string());
@@ -289,6 +527,11 @@ impl SynVisitor {
     pub fn report_and_dump(&self, output: String, update: bool) {
         if self.has_error {
             eprintln!("Please fix the errors in src/rpc");
+            exit(1);
+        }
+
+        // Check store types are in types-dir (before generating schema)
+        if !self.check_store_types_in_types_dir() {
             exit(1);
         }
 
@@ -319,10 +562,11 @@ impl SynVisitor {
             }
         }
         if failed {
+            let dirs_str = self.dirs.join(" -s ");
             eprintln!("migration check failed ...");
             eprintln!(
                 "Please use `migration-check -s {} -o {} -u` to update the fingerprint, and remember to write a migration",
-                self.dir, output
+                dirs_str, output
             );
             exit(1);
         } else {
@@ -335,17 +579,19 @@ impl SynVisitor {
     }
 
     pub fn walk_dir(&mut self) {
-        let dir = self.dir.clone();
+        let dirs = self.dirs.clone();
         let mut files = vec![];
-        for entry in WalkDir::new(dir).follow_links(true).into_iter() {
-            match entry {
-                Ok(ref e)
-                    if !e.file_name().to_string_lossy().starts_with('.')
-                        && e.file_name().to_string_lossy().ends_with(".rs") =>
-                {
-                    files.push(e.path().to_owned());
+        for dir in &dirs {
+            for entry in WalkDir::new(dir).follow_links(true).into_iter() {
+                match entry {
+                    Ok(ref e)
+                        if !e.file_name().to_string_lossy().starts_with('.')
+                            && e.file_name().to_string_lossy().ends_with(".rs") =>
+                    {
+                        files.push(e.path().to_owned());
+                    }
+                    _ => (),
                 }
-                _ => (),
             }
         }
         // different order may produce different hash
@@ -368,8 +614,26 @@ impl Visit<'_> for SynVisitor {
             syn::Item::Type(item_type) => {
                 let type_name = item_type.ident.to_string();
                 self.types.push(type_name.clone());
+                self.record_type_file(&type_name);
                 let type_deps = self.calc_dep_types(*item_type.ty.clone());
                 self.add_type_deps(&type_name, type_deps.clone());
+            }
+            syn::Item::Impl(item_impl) => {
+                // Detect `impl Serialize for TypeName` to track custom Serialize impls
+                if let Some((_, ref trait_path, _)) = item_impl.trait_ {
+                    let trait_name = trait_path
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default();
+                    if trait_name == "Serialize" {
+                        if let Type::Path(ref type_path) = *item_impl.self_ty {
+                            if let Some(seg) = type_path.path.segments.last() {
+                                self.custom_serializable_types.insert(seg.ident.to_string());
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -383,15 +647,20 @@ impl Visit<'_> for SynVisitor {
 #[derive(Parser)]
 #[command(author, version, about = "Schema migration checking tool")]
 struct Cli {
-    /// Output file path
-    #[clap(short, long)]
-    source_code_dir: String,
+    /// Source code directories to scan (can be specified multiple times)
+    #[clap(short, long, required = true, num_args = 1..)]
+    source_code_dir: Vec<String>,
 
     /// Output file path
     #[clap(short, long)]
     output: Option<String>,
 
-    /// for update fingerprint
+    /// Types crate source directory. When specified, the tool will check that
+    /// all store-reachable types (from KeyValue enum) are defined within this
+    /// directory and error if any are found outside it.
+    #[clap(short, long)]
+    types_dir: Option<String>,
+
     /// Force update fingerprint
     #[arg(short = 'u', long, default_value_t = false)]
     update: bool,
@@ -399,11 +668,11 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    let mut visitor = SynVisitor::new(&cli.source_code_dir);
+    let mut visitor = SynVisitor::new(cli.source_code_dir.clone(), cli.types_dir.clone());
     visitor.walk_dir();
 
     let output = cli.output.clone().unwrap_or_else(|| {
-        let mut path = cli.source_code_dir.clone();
+        let mut path = cli.source_code_dir.first().unwrap().clone();
         path.push_str(".schema.json");
         path
     });
