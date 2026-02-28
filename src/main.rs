@@ -53,6 +53,9 @@ pub struct SynVisitor {
     type_fingerprint: HashMap<String, String>,
     type_deps: HashMap<String, Vec<String>>,
     store_types: Vec<String>,
+    /// KeyValue variant info: (variant_name, dep_types) for each variant.
+    /// Used to produce meaningful dep chains like `KeyValue::Variant -> Type -> Target`.
+    store_variants: Vec<(String, Vec<String>)>,
     /// All source directories to scan
     dirs: Vec<String>,
     /// Optional: the types-dir path prefix. Types defined in files under this
@@ -80,6 +83,7 @@ impl SynVisitor {
             type_fingerprint: HashMap::new(),
             type_deps: HashMap::new(),
             store_types: Vec::new(),
+            store_variants: Vec::new(),
             dirs,
             types_dir,
             type_file: HashMap::new(),
@@ -288,6 +292,8 @@ impl SynVisitor {
             self.derive_serializable_types.insert(enum_name.clone());
         }
 
+        let is_key_value = enum_name == "KeyValue";
+
         let mut fingerprint = String::new();
         fingerprint.push_str(&format!("enum_name:{}\n", enum_name));
 
@@ -295,6 +301,7 @@ impl SynVisitor {
             let variant_name = variant.ident.to_string();
             fingerprint.push_str(&format!("variant:{}\n", variant_name));
 
+            let mut variant_dep_types = vec![];
             for field in &variant.fields {
                 if self.in_rpc {
                     // RPC check runs on all fields (regardless of serde attrs)
@@ -306,9 +313,15 @@ impl SynVisitor {
                     }
                     let field_type = quote::quote! { #field.ty }.to_string();
                     fingerprint.push_str(&format!("field:{}\n", field_type));
-                    dep_types.extend(self.calc_dep_types(field.ty.clone()));
+                    variant_dep_types.extend(self.calc_dep_types(field.ty.clone()));
                 }
             }
+
+            if is_key_value && !self.in_rpc {
+                self.store_variants
+                    .push((variant_name, variant_dep_types.clone()));
+            }
+            dep_types.extend(variant_dep_types);
         }
 
         if !self.in_rpc {
@@ -317,7 +330,7 @@ impl SynVisitor {
             let finger_hash = format!("{:x}", hasher.finalize());
             self.type_fingerprint.insert(enum_name.clone(), finger_hash);
             self.add_type_deps(&enum_name, dep_types.clone());
-            if enum_name == "KeyValue" {
+            if is_key_value {
                 self.store_types = dep_types.clone();
             }
         }
@@ -468,9 +481,9 @@ impl SynVisitor {
                         "WARNING: Store type `{}` is NOT defined in types-dir ({}), found in: {}",
                         type_name, types_dir, file_path
                     );
-                    // Print a short dependency chain for context (only first chain)
-                    let chains = self.try_find_type_chain(type_name);
-                    if let Some(chain) = chains.first() {
+                    // Print dependency chains for context
+                    let chains = self.try_find_type_chain(type_name, true);
+                    for chain in &chains {
                         eprintln!("  Dependency chain: {}", chain);
                     }
                     has_error = true;
@@ -487,41 +500,96 @@ impl SynVisitor {
         !has_error
     }
 
-    fn recursive_find_type(
-        &self,
-        target_type: &str,
-        type_name: &str,
-        current_chain: &mut Vec<String>,
-        result: &mut Vec<Vec<String>>,
-    ) {
-        if target_type == type_name {
-            current_chain.push(type_name.to_string());
-            result.push(current_chain.clone());
-            return;
-        }
-        // Cycle detection: skip if we've already visited this type in the chain
-        if current_chain.contains(&type_name.to_string()) {
-            return;
-        }
-        current_chain.push(type_name.to_string());
-        if let Some(deps_vec) = self.type_deps.get(type_name) {
-            for dep in deps_vec {
-                let mut next_chain = current_chain.clone();
-                self.recursive_find_type(target_type, dep, &mut next_chain, result);
+    /// Find dependency chains from KeyValue variants to a target type.
+    /// Returns chains like: `KeyValue::PaymentHistoryTimedResult -> Direction`
+    /// or `KeyValue::PaymentSession -> PaymentData -> SomeType`
+    ///
+    /// If `serialize_aware` is true, only follows deps through derive-Serialize types
+    /// (matching the collect_serializable_store_types logic). Otherwise follows all deps.
+    fn try_find_type_chain(&self, target_type: &str, serialize_aware: bool) -> Vec<String> {
+        let builtin: HashSet<&str> = BUILTIN_TYPES.iter().copied().collect();
+        let mut result = vec![];
+
+        for (variant_name, variant_deps) in &self.store_variants {
+            // Check if this variant can reach target_type
+            for dep in variant_deps {
+                let mut visited = HashSet::new();
+                let mut chain = vec![format!("KeyValue::{}", variant_name)];
+                if self.find_chain_to_target(
+                    target_type,
+                    dep,
+                    &mut chain,
+                    &mut visited,
+                    &builtin,
+                    serialize_aware,
+                ) {
+                    result.push(chain.join(" -> "));
+                }
             }
         }
+
+        // Deduplicate chains
+        result.sort();
+        result.dedup();
+        result
     }
 
-    fn try_find_type_chain(&self, target_type: &str) -> Vec<String> {
-        let mut result = vec![];
-        for type_name in &self.store_types {
-            let mut current_chain = vec![];
-            self.recursive_find_type(target_type, type_name, &mut current_chain, &mut result);
+    /// DFS to find a chain from `current` to `target_type`.
+    /// If `serialize_aware` is true, only follows deps through derive-Serialize types
+    /// and skips custom-Serialize types.
+    fn find_chain_to_target(
+        &self,
+        target_type: &str,
+        current: &str,
+        chain: &mut Vec<String>,
+        visited: &mut HashSet<String>,
+        builtin: &HashSet<&str>,
+        serialize_aware: bool,
+    ) -> bool {
+        if current == target_type {
+            chain.push(current.to_string());
+            return true;
         }
-        result
-            .iter()
-            .map(|chain| chain.join(" -> "))
-            .collect::<Vec<String>>()
+
+        if visited.contains(current) || builtin.contains(current) {
+            return false;
+        }
+        visited.insert(current.to_string());
+
+        if serialize_aware {
+            // Skip custom-Serialize types (we don't follow their deps)
+            if self.custom_serializable_types.contains(current) {
+                return false;
+            }
+
+            // Only follow deps for derive-Serialize types
+            if !self.derive_serializable_types.contains(current) {
+                return false;
+            }
+        }
+
+        if let Some(deps) = self.type_deps.get(current) {
+            chain.push(current.to_string());
+            for dep in deps {
+                let mut branch_chain = chain.clone();
+                let mut branch_visited = visited.clone();
+                if self.find_chain_to_target(
+                    target_type,
+                    dep,
+                    &mut branch_chain,
+                    &mut branch_visited,
+                    builtin,
+                    serialize_aware,
+                ) {
+                    *chain = branch_chain;
+                    visited.extend(branch_visited);
+                    return true;
+                }
+            }
+            chain.pop(); // backtrack
+        }
+
+        false
     }
 
     pub fn report_and_dump(&self, output: String, update: bool) {
@@ -553,7 +621,7 @@ impl SynVisitor {
                             type_name, old_finger, new_finger
                         );
                         eprintln!("Type dependency chain:");
-                        for chain in self.try_find_type_chain(type_name) {
+                        for chain in self.try_find_type_chain(type_name, false) {
                             eprintln!("  {}", chain);
                         }
                         failed = true;
