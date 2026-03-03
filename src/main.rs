@@ -592,6 +592,176 @@ impl SynVisitor {
         false
     }
 
+    /// Query a single type: print whether it is reachable from KeyValue (store-related)
+    /// and if so, print all dependency chains from KeyValue to it.
+    pub fn query_type(&self, type_name: &str) {
+        // First check if the type exists at all in the scanned source
+        if !self.types.contains(&type_name.to_string()) {
+            eprintln!(
+                "Type `{}` was not found in the scanned source directories.",
+                type_name
+            );
+            eprintln!("Scanned directories: {:?}", self.dirs);
+            exit(1);
+        }
+
+        // Check if it's reachable from KeyValue
+        let all_store_types = self.collect_all_store_reachable_types();
+        if all_store_types.contains(type_name) {
+            println!(
+                "Type `{}` is STORE-RELATED (reachable from KeyValue).",
+                type_name
+            );
+            println!();
+
+            // Print file location
+            if let Some(file) = self.type_file.get(type_name) {
+                println!("Defined in: {}", file);
+            }
+
+            // Print dependency chains
+            let chains = self.try_find_type_chain(type_name, false);
+            if chains.is_empty() {
+                println!("  (direct KeyValue variant type)");
+            } else {
+                println!("Dependency chain(s) from KeyValue:");
+                for chain in &chains {
+                    println!("  {}", chain);
+                }
+            }
+
+            // Also show what types this type depends on (that are also store types)
+            if let Some(deps) = self.type_deps.get(type_name) {
+                let store_deps: Vec<&String> = deps
+                    .iter()
+                    .filter(|d| all_store_types.contains(d.as_str()))
+                    .collect();
+                if !store_deps.is_empty() {
+                    println!();
+                    println!("Store-related dependencies of `{}`:", type_name);
+                    for dep in &store_deps {
+                        println!("  -> {}", dep);
+                    }
+                }
+            }
+        } else {
+            println!("Type `{}` is NOT related to the store.", type_name);
+            println!(
+                "It is not reachable from KeyValue and can be changed without a store migration."
+            );
+            if let Some(file) = self.type_file.get(type_name) {
+                println!("Defined in: {}", file);
+            }
+        }
+    }
+
+    /// Collect ALL type names reachable from KeyValue, following all deps
+    /// (not serialize-aware — includes everything in the transitive closure).
+    fn collect_all_store_reachable_types(&self) -> HashSet<String> {
+        let builtin: HashSet<&str> = BUILTIN_TYPES.iter().copied().collect();
+        let mut visited = HashSet::new();
+
+        fn walk(
+            visitor: &SynVisitor,
+            type_name: &str,
+            visited: &mut HashSet<String>,
+            builtin: &HashSet<&str>,
+        ) {
+            if visited.contains(type_name) || builtin.contains(type_name) {
+                return;
+            }
+            // Only include types that were actually defined in scanned source
+            if !visitor.type_fingerprint.contains_key(type_name)
+                && !visitor.type_deps.contains_key(type_name)
+            {
+                return;
+            }
+            visited.insert(type_name.to_string());
+            if let Some(deps) = visitor.type_deps.get(type_name) {
+                for dep in deps {
+                    walk(visitor, dep, visited, builtin);
+                }
+            }
+        }
+
+        for type_name in &self.store_types {
+            walk(self, type_name, &mut visited, &builtin);
+        }
+        visited
+    }
+
+    /// List all types NOT reachable from KeyValue.
+    /// Groups output by file path for readability.
+    pub fn list_non_store_types(&self) {
+        let all_store_types = self.collect_all_store_reachable_types();
+
+        // Collect all defined types (with fingerprints, i.e., structs/enums)
+        // that are NOT in the store reachable set
+        let mut non_store: Vec<(&String, Option<&String>)> = self
+            .types
+            .iter()
+            .filter(|t| !all_store_types.contains(t.as_str()))
+            .filter(|t| !BUILTIN_TYPES.contains(&t.as_str()))
+            .filter(|t| self.type_fingerprint.contains_key(t.as_str()))
+            .map(|t| (t, self.type_file.get(t)))
+            .collect();
+
+        // Sort by file path then by name
+        non_store.sort_by(|a, b| {
+            let fa = a.1.map(|s| s.as_str()).unwrap_or("");
+            let fb = b.1.map(|s| s.as_str()).unwrap_or("");
+            fa.cmp(fb).then(a.0.cmp(b.0))
+        });
+        non_store.dedup();
+
+        // Also collect store types for comparison
+        let mut store_list: Vec<(&String, Option<&String>)> = self
+            .types
+            .iter()
+            .filter(|t| all_store_types.contains(t.as_str()))
+            .filter(|t| !BUILTIN_TYPES.contains(&t.as_str()))
+            .filter(|t| self.type_fingerprint.contains_key(t.as_str()))
+            .map(|t| (t, self.type_file.get(t)))
+            .collect();
+        store_list.sort_by(|a, b| {
+            let fa = a.1.map(|s| s.as_str()).unwrap_or("");
+            let fb = b.1.map(|s| s.as_str()).unwrap_or("");
+            fa.cmp(fb).then(a.0.cmp(b.0))
+        });
+        store_list.dedup();
+
+        println!(
+            "=== Types RELATED to store ({} types) ===",
+            store_list.len()
+        );
+        let mut last_file = "";
+        for (type_name, file) in &store_list {
+            let f = file.map(|s| s.as_str()).unwrap_or("(unknown)");
+            if f != last_file {
+                println!();
+                println!("  # {}", f);
+                last_file = f;
+            }
+            println!("    {}", type_name);
+        }
+
+        println!();
+        println!(
+            "=== Types NOT related to store ({} types) ===",
+            non_store.len()
+        );
+        last_file = "";
+        for (type_name, file) in &non_store {
+            let f = file.map(|s| s.as_str()).unwrap_or("(unknown)");
+            if f != last_file {
+                println!();
+                println!("  # {}", f);
+                last_file = f;
+            }
+            println!("    {}", type_name);
+        }
+    }
+
     pub fn report_and_dump(&self, output: String, update: bool) {
         if self.has_error {
             eprintln!("Please fix the errors in src/rpc");
@@ -732,12 +902,36 @@ struct Cli {
     /// Force update fingerprint
     #[arg(short = 'u', long, default_value_t = false)]
     update: bool,
+
+    /// Query a type's store dependency chain. If the type is reachable from
+    /// KeyValue (i.e., it is persisted to the store), prints the dependency
+    /// chain(s). Otherwise prints that the type is not related to the store.
+    #[clap(short, long)]
+    query_type: Option<String>,
+
+    /// List all types defined in the scanned source that are NOT related to
+    /// the store (i.e., not reachable from KeyValue). Useful for identifying
+    /// types that can be safely moved without migration concerns.
+    #[clap(long, default_value_t = false)]
+    list_non_store_types: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
     let mut visitor = SynVisitor::new(cli.source_code_dir.clone(), cli.types_dir.clone());
     visitor.walk_dir();
+
+    // --query-type: query a single type and exit
+    if let Some(ref type_name) = cli.query_type {
+        visitor.query_type(type_name);
+        return;
+    }
+
+    // --list-non-store-types: list all non-store types and exit
+    if cli.list_non_store_types {
+        visitor.list_non_store_types();
+        return;
+    }
 
     let output = cli.output.clone().unwrap_or_else(|| {
         let mut path = cli.source_code_dir.first().unwrap().clone();
