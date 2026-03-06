@@ -371,14 +371,28 @@ impl SynVisitor {
         if visited.contains_key(type_name) {
             return;
         }
-        let finger = self.type_fingerprint.get(type_name);
-        if let Some(finger) = finger {
-            fingerprints.insert(type_name.to_string(), finger.clone());
+
+        // For types with custom `impl Serialize`: don't record their fingerprint.
+        // But still traverse their dependencies to find the actual serialized types.
+        // We only traverse dependencies that are derive-serializable (since custom
+        // Serialize impls typically delegate to inner derive-serializable types).
+        let is_custom_serialize = self.custom_serializable_types.contains(type_name);
+        if !is_custom_serialize {
+            let finger = self.type_fingerprint.get(type_name);
+            if let Some(finger) = finger {
+                fingerprints.insert(type_name.to_string(), finger.clone());
+            }
         }
 
         visited.insert(type_name.to_string(), true);
         if let Some(deps_vec) = self.type_deps.get(type_name) {
             for dep in deps_vec {
+                // For custom Serialize types, only traverse dependencies that are
+                // derive-serializable (these are likely the actually serialized inner types).
+                // For derive-serializable types, traverse all dependencies.
+                if is_custom_serialize && !self.derive_serializable_types.contains(dep) {
+                    continue;
+                }
                 self.collect_fingerprints(dep, visited, fingerprints);
             }
         }
