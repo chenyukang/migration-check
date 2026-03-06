@@ -134,26 +134,43 @@ impl SynVisitor {
         })
     }
 
-    /// Returns true if the field has `#[serde(skip)]`, `#[serde(skip_serializing)]`,
-    /// or `#[serde(skip_deserializing)]` — meaning it is never (fully) serialized
-    /// and should be excluded from the fingerprint and dependency graph.
-    /// Other serde attributes (rename, default, skip_serializing_if, etc.) do NOT
-    /// cause a field to be skipped.
+    /// Returns true if the field should be excluded from the fingerprint and
+    /// dependency graph. This includes:
+    /// - `#[serde(skip)]`, `#[serde(skip_serializing)]`, `#[serde(skip_deserializing)]`
+    /// - `#[skip_store]` - explicit annotation for migration-check
+    /// - `#[cfg_attr(any(), skip_store)]` - conditional skip_store annotation
     fn should_skip_field(&self, field: &syn::Field) -> bool {
         field.attrs.iter().any(|attr| {
             let attr_name = attr.path().segments.last().unwrap().ident.to_string();
-            if attr_name != "serde" {
-                return false;
+
+            // Check for #[skip_store] attribute
+            if attr_name == "skip_store" {
+                return true;
             }
-            let tokens = self.get_attr_tokens(attr);
-            // Split by comma to check each individual directive.
-            // e.g. #[serde(skip, default)] → tokens = "skip , default"
-            tokens.split(',').any(|part| {
-                let trimmed = part.trim();
-                trimmed == "skip"
-                    || trimmed == "skip_serializing"
-                    || trimmed == "skip_deserializing"
-            })
+
+            // Check for #[cfg_attr(any(), skip_store)] pattern
+            if attr_name == "cfg_attr" {
+                let tokens = self.get_attr_tokens(attr);
+                // Check if tokens contain "skip_store"
+                if tokens.contains("skip_store") {
+                    return true;
+                }
+            }
+
+            // Check for serde skip attributes
+            if attr_name == "serde" {
+                let tokens = self.get_attr_tokens(attr);
+                // Split by comma to check each individual directive.
+                // e.g. #[serde(skip, default)] → tokens = "skip , default"
+                return tokens.split(',').any(|part| {
+                    let trimmed = part.trim();
+                    trimmed == "skip"
+                        || trimmed == "skip_serializing"
+                        || trimmed == "skip_deserializing"
+                });
+            }
+
+            false
         })
     }
 
@@ -374,8 +391,8 @@ impl SynVisitor {
 
         // For types with custom `impl Serialize`: don't record their fingerprint.
         // But still traverse their dependencies to find the actual serialized types.
-        // We only traverse dependencies that are derive-serializable (since custom
-        // Serialize impls typically delegate to inner derive-serializable types).
+        // Dependencies from fields marked with `skip_store` have already been excluded
+        // when building type_deps.
         let is_custom_serialize = self.custom_serializable_types.contains(type_name);
         if !is_custom_serialize {
             let finger = self.type_fingerprint.get(type_name);
@@ -387,12 +404,6 @@ impl SynVisitor {
         visited.insert(type_name.to_string(), true);
         if let Some(deps_vec) = self.type_deps.get(type_name) {
             for dep in deps_vec {
-                // For custom Serialize types, only traverse dependencies that are
-                // derive-serializable (these are likely the actually serialized inner types).
-                // For derive-serializable types, traverse all dependencies.
-                if is_custom_serialize && !self.derive_serializable_types.contains(dep) {
-                    continue;
-                }
                 self.collect_fingerprints(dep, visited, fingerprints);
             }
         }
@@ -435,23 +446,22 @@ impl SynVisitor {
             }
             visited.insert(type_name.to_string());
 
-            // For types with custom `impl Serialize`: skip entirely.
-            // These are wrappers (like ChannelActorState) whose actual serialized
-            // content is an inner type that will be checked separately.
-            // We can't determine which fields are serialized from syntax alone.
-            if visitor.custom_serializable_types.contains(type_name) {
-                return;
+            // For types with custom `impl Serialize`: don't add to result,
+            // but still traverse their dependencies to find the actual serialized types.
+            // The dependencies have already been filtered to exclude skip_store fields.
+            let is_custom_serialize = visitor.custom_serializable_types.contains(type_name);
+            if !is_custom_serialize {
+                // Only include this type if it has a fingerprint (i.e., it was defined
+                // in the scanned source)
+                if visitor.type_fingerprint.contains_key(type_name) {
+                    result.insert(type_name.to_string());
+                }
             }
 
-            // Only include this type if it has a fingerprint (i.e., it was defined
-            // in the scanned source)
-            if visitor.type_fingerprint.contains_key(type_name) {
-                result.insert(type_name.to_string());
-            }
-
-            // For types with #[derive(Serialize)]: follow their field deps
-            // (we know all non-skipped fields are serialized).
-            if visitor.derive_serializable_types.contains(type_name) {
+            // For types with #[derive(Serialize)] or custom impl Serialize:
+            // follow their field deps. For derive-serializable, we know all non-skipped
+            // fields are serialized. For custom Serialize, deps are already filtered.
+            if visitor.derive_serializable_types.contains(type_name) || is_custom_serialize {
                 if let Some(deps_vec) = visitor.type_deps.get(type_name) {
                     for dep in deps_vec {
                         collect_recursive(visitor, dep, visited, result, builtin);
@@ -619,9 +629,9 @@ impl SynVisitor {
             exit(1);
         }
 
-        // Check if it's reachable from KeyValue
-        let all_store_types = self.collect_all_store_reachable_types();
-        if all_store_types.contains(type_name) {
+        // Check if it's reachable from KeyValue (using serialize-aware collection)
+        let store_types = self.collect_serializable_store_types();
+        if store_types.contains(type_name) {
             println!(
                 "Type `{}` is STORE-RELATED (reachable from KeyValue).",
                 type_name
@@ -633,8 +643,8 @@ impl SynVisitor {
                 println!("Defined in: {}", file);
             }
 
-            // Print dependency chains
-            let chains = self.try_find_type_chain(type_name, false);
+            // Print dependency chains (serialize-aware to match the actual tracking)
+            let chains = self.try_find_type_chain(type_name, true);
             if chains.is_empty() {
                 println!("  (direct KeyValue variant type)");
             } else {
@@ -648,7 +658,7 @@ impl SynVisitor {
             if let Some(deps) = self.type_deps.get(type_name) {
                 let store_deps: Vec<&String> = deps
                     .iter()
-                    .filter(|d| all_store_types.contains(d.as_str()))
+                    .filter(|d| store_types.contains(d.as_str()))
                     .collect();
                 if !store_deps.is_empty() {
                     println!();
