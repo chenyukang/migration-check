@@ -137,23 +137,22 @@ impl SynVisitor {
     /// Returns true if the field should be excluded from the fingerprint and
     /// dependency graph. This includes:
     /// - `#[serde(skip)]`, `#[serde(skip_serializing)]`, `#[serde(skip_deserializing)]`
-    /// - `#[skip_store]` - explicit annotation for migration-check
-    /// - `#[cfg_attr(any(), skip_store)]` - conditional skip_store annotation
+    /// - `#[doc = "skip_store"]` - explicit annotation for migration-check (uses doc attribute for compatibility)
     fn should_skip_field(&self, field: &syn::Field) -> bool {
         field.attrs.iter().any(|attr| {
             let attr_name = attr.path().segments.last().unwrap().ident.to_string();
 
-            // Check for #[skip_store] attribute
-            if attr_name == "skip_store" {
-                return true;
-            }
-
-            // Check for #[cfg_attr(any(), skip_store)] pattern
-            if attr_name == "cfg_attr" {
-                let tokens = self.get_attr_tokens(attr);
-                // Check if tokens contain "skip_store"
-                if tokens.contains("skip_store") {
-                    return true;
+            // Check for #[doc = "skip_store"] pattern
+            // doc attributes are NameValue meta, so we need to check the value directly
+            if attr_name == "doc" {
+                if let syn::Meta::NameValue(nv) = &attr.meta {
+                    if let syn::Expr::Lit(expr_lit) = &nv.value {
+                        if let syn::Lit::Str(lit_str) = &expr_lit.lit {
+                            if lit_str.value().contains("skip_store") {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
 
