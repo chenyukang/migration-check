@@ -100,11 +100,8 @@ impl SynVisitor {
         match ty {
             Type::Path(type_path) => {
                 for elem in quote::quote! { #type_path } {
-                    match elem {
-                        TokenTree::Ident(ident) => {
-                            dep_types.push(format!("{}", quote::quote! { #ident }));
-                        }
-                        _ => {}
+                    if let TokenTree::Ident(ident) = elem {
+                        dep_types.push(format!("{}", quote::quote! { #ident }));
                     }
                 }
             }
@@ -131,6 +128,27 @@ impl SynVisitor {
             } else {
                 false
             }
+        })
+    }
+
+    /// An RPC numeric field needs hex formatting only when its type derives
+    /// serialization. `#[serde_as]` alone does not make an internal helper a
+    /// request or response type.
+    fn has_serde_derive(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            if !attr.path().is_ident("derive") {
+                return false;
+            }
+            attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|paths| {
+                paths.iter().any(|path| {
+                    path.segments.last().is_some_and(|segment| {
+                        segment.ident == "Serialize" || segment.ident == "Deserialize"
+                    })
+                })
+            })
         })
     }
 
@@ -178,6 +196,18 @@ impl SynVisitor {
     // e.g. #[serde_as(as = "Option<u8>")]
     // or #[serde_as(as = "u8")]
     fn check_rpc_field(&mut self, struct_name: &str, field: &syn::Field) {
+        if field
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("serde"))
+            .any(|attr| {
+                self.get_attr_tokens(attr)
+                    .split(',')
+                    .any(|part| part.trim() == "skip")
+            })
+        {
+            return;
+        }
         let ty = field.ty.clone();
         let dep_types = self.calc_dep_types(ty);
         if dep_types.len() > 2 {
@@ -266,26 +296,25 @@ impl SynVisitor {
 
         fingerprint.push_str(&format!("struct_name:{}\n", struct_name));
 
+        // Internal helpers without a serialization derive are not RPC DTOs.
+        let check_rpc = self.in_rpc && Self::has_serde_derive(&item_struct.attrs);
+
         let mut dep_types = vec![];
-        match &item_struct.fields {
-            Fields::Named(fields) => {
-                for field in &fields.named {
-                    if self.in_rpc {
-                        // RPC check runs on all fields (regardless of serde attrs)
-                        self.check_rpc_field(&struct_name, field);
-                    } else {
-                        // For fingerprint/deps, skip fields with #[serde(skip)]
-                        if self.should_skip_field(field) {
-                            continue;
-                        }
-                        let field_type = quote::quote! { #field.ty }.to_string();
-                        let field_type = field_type.split(":").last().unwrap_or_default();
-                        fingerprint.push_str(&format!("field: {}\n", field_type));
-                        dep_types.extend(self.calc_dep_types(field.ty.clone()));
+        if let Fields::Named(fields) = &item_struct.fields {
+            for field in &fields.named {
+                if check_rpc {
+                    self.check_rpc_field(&struct_name, field);
+                } else if !self.in_rpc {
+                    // For fingerprint/deps, skip fields with #[serde(skip)]
+                    if self.should_skip_field(field) {
+                        continue;
                     }
+                    let field_type = quote::quote! { #field.ty }.to_string();
+                    let field_type = field_type.split(":").last().unwrap_or_default();
+                    fingerprint.push_str(&format!("field: {}\n", field_type));
+                    dep_types.extend(self.calc_dep_types(field.ty.clone()));
                 }
             }
-            _ => {}
         }
 
         if !self.in_rpc {
@@ -313,16 +342,17 @@ impl SynVisitor {
         let mut fingerprint = String::new();
         fingerprint.push_str(&format!("enum_name:{}\n", enum_name));
 
+        let check_rpc = self.in_rpc && Self::has_serde_derive(&item_enum.attrs);
+
         for variant in &item_enum.variants {
             let variant_name = variant.ident.to_string();
             fingerprint.push_str(&format!("variant:{}\n", variant_name));
 
             let mut variant_dep_types = vec![];
             for field in &variant.fields {
-                if self.in_rpc {
-                    // RPC check runs on all fields (regardless of serde attrs)
+                if check_rpc {
                     self.check_rpc_field(&enum_name, field);
-                } else {
+                } else if !self.in_rpc {
                     // For fingerprint/deps, skip fields with #[serde(skip)]
                     if self.should_skip_field(field) {
                         continue;
@@ -466,7 +496,6 @@ impl SynVisitor {
                         collect_recursive(visitor, dep, visited, result, builtin);
                     }
                 }
-                return;
             }
 
             // Types without any Serialize: don't traverse further.
@@ -963,3 +992,6 @@ fn main() {
     });
     visitor.report_and_dump(output, cli.update);
 }
+
+#[cfg(test)]
+mod main_tests;
